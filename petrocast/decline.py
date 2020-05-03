@@ -1,8 +1,8 @@
 import numpy as np
 import pandas as pd
 from scipy import optimize
-from scipy.stats.distributions import t
 from scipy.stats.distributions import norm
+from scipy.stats import probplot
 
 from functools import partial
 
@@ -10,11 +10,11 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as clr
 from matplotlib.ticker import FuncFormatter
 
+from tqdm import tqdm
 import logging
 
 class ArpsDecline():
-    """ 
-    Arps Decline Curve Analysis
+    """ Arps Decline Curve Analysis
     ===
 
     Based on Arps Equation (1945).
@@ -33,14 +33,15 @@ class ArpsDecline():
         Cumulative production
     rate : list, numpy array
         Production rate
+    time_offset : float
+        time offset for first data point
     """
-    def __init__(self, cumprod: list, rate: list, time: list=None):
-        self._best_curve = ''
+    def __init__(self, cumprod: list, rate: list, time_offset: float=0):
         self._MODEL_NAME = {'exp':'exponential', 'har':'harmonic', 'hyp':'hyperbolic'}
         
         self._rate = np.asarray(rate)
         self._cumprod = np.asarray(cumprod)
-        self._time = np.asarray(time)
+        self._time_offset = np.asarray(time_offset)
 
         if len(cumprod) != len(rate):
             raise IndexError("cumulative production and rate must have the same length")
@@ -132,7 +133,7 @@ class ArpsDecline():
         idx = np.random.randint(0, row, (sample, row))
         prod_sample = prod_data[idx]
         bootstrap_result = [self._fit_data(prod_sample[s, :, 0], prod_sample[s, :, 1], model)
-                            for s in range(sample)]
+                            for s in tqdm(range(sample))]
         rate_init = np.asarray([bootstrap_result[i].x[0] for i in range(sample)])
         d_rate = np.asarray([bootstrap_result[i].x[1] for i in range(sample)])
         if model == 'exp':
@@ -142,7 +143,27 @@ class ArpsDecline():
         else:
             b_exp = np.asarray([bootstrap_result[i].x[2] for i in range(sample)])
         return rate_init, d_rate, b_exp
- 
+    
+    def _uncertainty_forecast(self, rate_forecast, sample: int=1000, seed=None):
+        # Calculate uncertainty in time and cumulative production.
+        rate_init, d_rate, b_exp = self._bootstrap(self._model, sample=sample, seed=seed)
+        if self._model == 'exp':
+            cumprod_forecast = np.asarray([self._exp_cum(rate_forecast, rate_init[s], d_rate[s])
+                                            for s in range(sample)])
+            time_forecast = np.asarray([self._exp_time(rate_forecast, rate_init[s], d_rate[s])
+                                        for s in range(sample)])
+        elif self._model == 'har':
+            cumprod_forecast = np.asarray([self._har_cum(rate_forecast, rate_init[s], d_rate[s])
+                                            for s in range(sample)])
+            time_forecast = np.asarray([self._har_time(rate_forecast, rate_init[s], d_rate[s])
+                                        for s in range(sample)])
+        else:
+            cumprod_forecast = np.asarray([self._hyp_cum(rate_forecast, rate_init[s], d_rate[s], b_exp[s])
+                                            for s in range(sample)])
+            time_forecast = np.asarray([self._hyp_time(rate_forecast, rate_init[s], d_rate[s], b_exp[s])
+                                        for s in range(sample)])
+        return time_forecast, cumprod_forecast
+
     def fit(self, model: str='best', d_rate_init: float=1E-5, b_exp_init: float=0.5,
             verbose: int=0, sig: float=0.2):
         """ 
@@ -151,6 +172,12 @@ class ArpsDecline():
 
         Parameters
         ---
+        model : str
+            model type:
+            'exp': Arps' exponential model
+            'har': Arps' harmonic model
+            'hyp': Arps' hyperbolic model
+            'best': find the best model that fit the data
         d_rate_init : float
             initial guess for decline rate (D)
         b_exp_init : float
@@ -196,16 +223,48 @@ class ArpsDecline():
                         'method: {self._model}, cost value: {self._cost_val[self._model]}')
         
     def eur(self, rate_eur: float=1):
-        self._rate_eur = rate_eur
+        """Calculate best EUR from specified rate
+
+        Parameter
+        ---
+        rate_eur : float
+            Minimum rate based on commercial or technical limit.
         
-        eur = self._func_cum[self._model](rate_eur, \
-                                            self._rate_init, \
-                                            self._d_rate)
+        Return
+        ---
+        eur : float
+            Estimated Ultimate Recovery
+        """
+        self._rate_eur = rate_eur
+        eur = self._func_cum[self._model](rate_eur, self._rate_init, self._d_rate)
         return eur
 
-    def forecast(self, rate_eur: float=1):
+    def time(self, rate_eur: float=1):
+        """Calculate Time from specified rate
+
+        Parameter
+        ---
+        rate_eur : float
+            Minimum rate based on commercial or technical limit.
+        
+        Return
+        ---
+        eur : float
+            Estimated Ultimate Recovery
         """
-        Forecast production profile.
+        self._rate_eur = rate_eur
+        time = self._func_time[self._model](rate_eur, self._rate_init, self._d_rate)
+        return time + self._time_offset
+
+    def forecast(self, rate_eur: float=1, num: int=50):
+        """ Forecast production profile.
+
+        Parameters
+        ---
+        rate_eur : float
+            Minimum rate based on commercial or technical limit.
+        num : int
+            Number of data points
 
         return
         ---
@@ -216,7 +275,7 @@ class ArpsDecline():
         rate : ndarray
             production rate
         """
-        rate_frcast = np.linspace(self._rate[-1], rate_eur)
+        rate_frcast = np.linspace(self._rate[-1], rate_eur, num)
         cumprod_frcast_mid = self._func_cum[self._model](rate_frcast, \
                                                             self._rate_init, \
                                                             self._d_rate)
@@ -226,16 +285,79 @@ class ArpsDecline():
 
         return time_frcast_mid, cumprod_frcast_mid, rate_frcast
 
-    def uncertainty_eur(self, rate_eur, sample: int=1000, seed=None):
-        _, cumprod = self._uncertainty_forecast(rate_eur, sample, seed)
-        P90 = np.percentile(cumprod, 10)
-        P10 = np.percentile(cumprod, 90)
-        return P90, self.eur(rate_eur), P10
+    def calculate_uncertainty_prediction(self, rate_eur, sample: int=1000, seed=None):
+        """ Calculate uncertainty based on specified Arps model.
 
-    def uncertainty_eur_histplot(self, rate_eur: float=10, sample=1000, 
-                                    seed=None, xcumprod: bool=True, 
-                                    color_style: str='oil', figsize=(12, 8)):
+        Parameters
+        ---
+        rate_eur : float
+            Minimum rate based on commercial or technical limit.
+        sample : int
+            Sample size to estimate the uncertainty
+        seed : int
+            Random seed
+
         
+        """
+        self._rate_eur = rate_eur
+        rate_forecast = np.linspace(self._rate[-1], self._rate_eur)
+        self._time_mc, self._cumprod_mc = self._uncertainty_forecast(rate_forecast, sample, seed)
+
+    def uncertainty_eur(self):
+        """ Calculate low, best, high case of EUR
+        According to PRMS 2018, low = P90, best = P50, high = P10
+
+        Return
+        ---
+        P90 : float
+            low case EUR
+        P50 : float
+            most likely EUR
+        P10 : float
+            high case EUR
+        """
+        P90 = np.percentile(self._cumprod_mc[:, -1], 10)
+        P10 = np.percentile(self._cumprod_mc[:, -1], 90)
+        return P90, self.eur(self._rate_eur), P10
+
+    def uncertainty_time(self):
+        """ Calculate low, best, high case of Time
+        According to PRMS 2018, low = P90, best = P50, high = P10
+
+        Return
+        ---
+        P90 : float
+            low case EUR
+        P50 : float
+            most likely EUR
+        P10 : float
+            high case EUR
+        """
+        P90 = np.percentile(self._time_mc[:, -1], 10)
+        P10 = np.percentile(self._time_mc[:, -1], 90)
+        return P90 + self._time_offset, self.time(self._rate_eur), P10 + self._time_offset
+
+    def uncertainty_histplot(self, xcumprod: bool=True, color_style: str='oil', 
+                                 hidey: bool=True, figsize=(12, 8)):
+        """ Plot EUR uncertainty based on specified Arps model.
+
+        Parameters
+        ---
+        rate_eur : float
+            Minimum rate based on commercial or technical limit.
+        sample : int
+            Sample size to estimate the uncertainty
+        seed : int
+            Random seed
+        xcumprod : bool
+            True for cumulative production, False for time
+        color_style : str
+            set 'oil' theme or 'gas' theme
+        hidey : bool
+            hide probability density axis
+        figsize : tuple
+            Figure size
+        """
         plt.style.use('ggplot')
         if color_style == 'gas':
             regclr = 'brown'
@@ -244,101 +366,65 @@ class ArpsDecline():
             regclr = 'darkgreen'
             sampleclr = 'limegreen'
         _, ax = plt.subplots(figsize=figsize)
-        _, cumprod = self._uncertainty_forecast(rate_eur, sample, seed)
-        loc, scale = norm.fit(cumprod)
-        ax.hist(cumprod, bins='auto', density=True, color=sampleclr, alpha=0.5)
+        if xcumprod:
+            loc, scale = norm.fit(self._cumprod_mc[:, -1])
+            ax.hist(self._cumprod_mc[:, -1], bins='auto', density=True, color=sampleclr, alpha=0.5)
+        else:
+            loc, scale = norm.fit(self._time_mc[:, -1])
+            ax.hist(self._time_mc[:, -1], bins='auto', density=True, color=sampleclr, alpha=0.5)
 
         dist = norm(loc=loc, scale=scale)
-        eur = np.linspace(dist.ppf(0.0005), dist.ppf(0.9995))
-        normal = ax.plot(eur, dist.pdf(eur), color=regclr)
-        P90 = np.percentile(cumprod, 10)
-        P50 = self.eur(rate_eur)
-        P10 = np.percentile(cumprod, 90)
+        xaxis = np.linspace(dist.ppf(0.0005), dist.ppf(0.9995))
+        normal = ax.plot(xaxis, dist.pdf(xaxis), color=regclr)
+        if xcumprod:
+            P90 = np.percentile(self._cumprod_mc[:, -1], 10)
+            P50 = self.eur(self._rate_eur)
+            P10 = np.percentile(self._cumprod_mc[:, -1], 90)
+        else:
+            P90 = np.percentile(self._time_mc[:, -1], 10)
+            P50 = self.time(self._rate_eur)
+            P10 = np.percentile(self._time_mc[:, -1], 90)
         low = ax.axvline(P90, color=regclr, linestyle='--', alpha=0.5)
         mid = ax.axvline(P50, color=regclr, linestyle='--', alpha=0.5)
         hgh = ax.axvline(P10, color=regclr, linestyle='--', alpha=0.5)
 
-        ax.set_xlim(eur[0], eur[-1])
+        ax.set_xlim(xaxis[0], xaxis[-1])
         ax.get_xaxis().set_major_formatter(FuncFormatter(lambda x, p: format(int(x), ',')))
-        ax.set_title(f'EUR Distribution based on Arps Model\nSelected Method: {self._MODEL_NAME[self._model]}')
+        if xcumprod:
+            ax.set_title((f'EUR Distribution based on Arps Model\n'
+                        f'Selected Method: {self._MODEL_NAME[self._model]}'))
+            ax.set_xlabel('Estimated Ultimate Recovery')
+        else:
+            ax.set_title((f'Time Distribution at EUR based on Arps Model\n'
+                        f'Selected Method: {self._MODEL_NAME[self._model]}'))
+            ax.set_xlabel('Time')
         ax.set_ylabel('Probability Density')
-        ax.set_xlabel('Estimated Ultimate Recovery')
+        
+        if hidey:
+            ax.yaxis.set_ticklabels([])
         ax.legend([normal, low, mid, hgh], ('PDF',
                                             f'P90: {round(P90, 2)}', 
                                             f'P50: {round(P50, 2)}', 
                                             f'P10: {round(P10, 2)}'))
         plt.show()
 
-    def uncert_rate(self,xcumprod=True, percentile=50):
-        """
-        Generate forecast based on specified curve.
+    def forecast_plot(self, bootstrap: bool=False, xcumprod: bool=True, color_style: str='oil', figsize=(12, 8)):
+        """ Plot decline curve model.
 
         Parameters
         ---
-        cumprod : float
-            cumulative production
-        selected_curve : str
-            exp: Exponential curve
-            hyp: Hyperbolic curve
-            har: Harmonic curve
-            auto: use the best fit curve
-            all: use all curve
-        
-        Returns
-        ---
-        rate : np.array
-        """
-        pass
-
-    def _uncertainty_forecast(self, rate_forecast, sample: int=1000, seed=None):
-        """
-        Calculate uncertainty for Estimated Ultimate Recovery (EUR)
-        based on specified curve.
-
-        Parameters
-        ---
-        rate_eur : float, list, ndarray
-            Usually assigned with minimum economic or technical rate.
-
-        selected_curve : str
-            exp: Exponential curve
-            hyp: Hyperbolic curve
-            har: Harmonic curve
-            best: use the best fit curve
-        
-        Returns
-        ---
-        eur : float
-            return EUR from selected curve.
-        """
-        rate_init, d_rate, b_exp = self._bootstrap(self._model, sample=sample, seed=seed)
-        if self._model == 'exp':
-            cumprod_frcast = np.asarray([self._exp_cum(rate_forecast, rate_init[s], d_rate[s])
-                                            for s in range(sample)])
-            time_frcast = np.asarray([self._exp_time(rate_forecast, rate_init[s], d_rate[s])
-                                        for s in range(sample)])
-        elif self._model == 'har':
-            cumprod_frcast = np.asarray([self._har_cum(rate_forecast, rate_init[s], d_rate[s])
-                                            for s in range(sample)])
-            time_frcast = np.asarray([self._har_time(rate_forecast, rate_init[s], d_rate[s])
-                                        for s in range(sample)])
-        else:
-            cumprod_frcast = np.asarray([self._hyp_cum(rate_forecast, rate_init[s], d_rate[s], b_exp[s])
-                                            for s in range(sample)])
-            time_frcast = np.asarray([self._hyp_time(rate_forecast, rate_init[s], d_rate[s], b_exp[s])
-                                        for s in range(sample)])
-        return time_frcast, cumprod_frcast
-
-    def uncertainty_forecast_plot(self, rate_eur: float=10, sample=1000, 
-                                    seed=None, xcumprod: bool=True, 
-                                    color_style: str='oil', figsize=(12, 8)):
-        """
-        Plot decline curve model.
-
-        Parameters
-        ---
+        rate_eur : float
+            Minimum rate based on commercial or technical limit.
+        sample : int
+            Sample size to estimate the uncertainty
+        seed : int
+            Random seed
+        xcumprod : bool
+            True for cumulative production, False for time
         color_style : str
-            'cartesian', 'semilog', 'loglog'
+            set 'oil' theme or 'gas' theme
+        figsize : tuple
+            Figure size
         """
         plt.style.use('ggplot')
         if color_style == 'gas':
@@ -353,23 +439,24 @@ class ArpsDecline():
             sampleclr = 'limegreen'
 
         _, ax = plt.subplots(figsize=figsize)
-        rate_forecast = np.linspace(self._rate[-1], rate_eur)
-        time_forecast_all, cumprod_forecast_all = self._uncertainty_forecast(rate_forecast, sample, seed)
-        time, cumprod, rate = self.forecast(rate_eur)
-        
+        time, cumprod, rate = self.forecast(self._rate_eur)
+        rate_forecast = np.linspace(self._rate[-1], self._rate_eur)
         if xcumprod:
-            for s in range(cumprod_forecast_all.shape[0]): # plot bootstrap result
-                ax.plot(cumprod_forecast_all[s], rate_forecast, color=sampleclr, alpha=0.03)
+            if bootstrap:
+                ax.plot(self._cumprod_mc.transpose(), 
+                        np.tile(rate_forecast, (self._cumprod_mc.shape[0], 1)).transpose(), 
+                        color=sampleclr, alpha=0.03) # plot bootstrap result
             ax.plot(cumprod, rate, color=cbandsclr, linestyle='--') # P50 forecast
             ax.scatter(self._cumprod, self._rate, color=histclr) # data points
             
             rate = self._func_rate[self._model](self._cumprod, self._rate_init, self._d_rate)
             ax.plot(self._cumprod, rate, color=regclr) # regression line
 
-            cumprod = np.percentile(cumprod_forecast_all, 10, axis=0)
-            ax.plot(cumprod, rate_forecast, color=cbandsclr, linestyle='--')
-            cumprod = np.percentile(cumprod_forecast_all, 90, axis=0)
-            ax.plot(cumprod, rate_forecast, color=cbandsclr, linestyle='--')
+            if bootstrap:
+                cumprod = np.percentile(self._cumprod_mc, 10, axis=0)
+                ax.plot(cumprod, rate_forecast, color=cbandsclr, linestyle='--')
+                cumprod = np.percentile(self._cumprod_mc, 90, axis=0)
+                ax.plot(cumprod, rate_forecast, color=cbandsclr, linestyle='--')
 
             if self._model != 'exp':
                 ax.set_yscale('log')
@@ -380,18 +467,21 @@ class ArpsDecline():
                 ax.grid(which='minor', axis='x')
             ax.set_xlabel('Cumulative Production')
         else:
-            for s in range(time_forecast_all.shape[0]): # plot bootstrap result
-                ax.plot(time_forecast_all[s], rate_forecast, color=sampleclr, alpha=0.03)
-            ax.plot(time, rate, color=cbandsclr, linestyle='--') # P50 forecast
+            if bootstrap:
+                ax.plot((self._time_mc + self._time_offset).transpose(), 
+                        np.tile(rate_forecast, (self._time_mc.shape[0], 1)).transpose(), 
+                        color=sampleclr, alpha=0.03) # plot bootstrap result
+            ax.plot(time + self._time_offset, rate, color=cbandsclr, linestyle='--') # P50 forecast
             rate = self._func_rate[self._model](self._cumprod, self._rate_init, self._d_rate)
             time = self._func_time[self._model](rate, self._rate_init, self._d_rate)
-            ax.scatter(time, self._rate, color=histclr) #data points
-            ax.plot(time, rate, color=regclr) # regression line
+            ax.scatter(time + self._time_offset, self._rate, color=histclr) #data points
+            ax.plot(time + self._time_offset, rate, color=regclr) # regression line
             
-            time = np.percentile(time_forecast_all, 10, axis=0)
-            ax.plot(time, rate_forecast, color=cbandsclr, linestyle='--')
-            time = np.percentile(time_forecast_all, 90, axis=0)
-            ax.plot(time, rate_forecast, color=cbandsclr, linestyle='--')
+            if bootstrap:
+                time = np.percentile(self._time_mc, 10, axis=0)
+                ax.plot(time + self._time_offset, rate_forecast, color=cbandsclr, linestyle='--')
+                time = np.percentile(self._time_mc, 90, axis=0)
+                ax.plot(time + self._time_offset, rate_forecast, color=cbandsclr, linestyle='--')
 
             ax.set_yscale('log')
             ax.grid(which='minor', axis='y')
@@ -401,27 +491,47 @@ class ArpsDecline():
                 ax.grid(which='minor', axis='x')
             ax.set_xlabel('Time')
 
-        ax.set_title(f"Arps Decline Model\nSelected Method: {self._MODEL_NAME[self._model]}")
-        ax.axhline(rate_eur, color='k', linestyle='dotted')
-        #ax.grid(which='major', axis='y')
+        ax.set_title((f"Arps Decline Model\n"
+                      f"Selected Method: {self._MODEL_NAME[self._model]}"))
+        ax.axhline(self._rate_eur, color='k', linestyle='dotted')
         ax.get_xaxis().set_major_formatter(FuncFormatter(lambda x, p: format(int(x), ',')))
         ax.set_ylim(bottom=1)
         ax.set_ylabel('Rate')
-        
         plt.show()
 
+    def residual_analysis_plot(self, figsize=(12, 6)):
+        """ Generate Residual and Probability Plot
+
+        Parameters
+        ---
+        figsize : tuple
+            Figure size
+        """
+        plt.style.use('ggplot')
+        rate = self._func_rate[self._model](self._cumprod, self._rate_init, self._d_rate)
+        fig, ax = plt.subplots(1, 2, figsize=figsize)
+        
+        ax[0].scatter(rate, rate - self._rate)
+        ax[0].axhline(0, linestyle='--')
+        ax[0].set_xlabel('Rate')
+        ax[0].set_ylabel('Residual')
+        ax[0].set_title(f"Residual Plot")
+        _, result = probplot(rate - self._rate, plot=ax[1])
+        _, _, r = result
+        fig.suptitle(('Residual Analysis\n'
+                      f'Selected Method: {self._MODEL_NAME[self._model]}\n'
+                      r'$R^2 =$' + f'{round(r**2, 4)}'))
+        
     def summary(self):
         """
         Provide summary of fitting calculations.
         """
-        print(f'Exponential message: {self._message["exp"]}')
-        print(f'Harmonic message: {self._message["har"]}')
-        print(f'Hyperbolic message: {self._message["hyp"]}')
+        print(f'Message: {self._message}')
 
         df = pd.DataFrame([self._rate_init, self._d_rate, self._b_exp,
                            self._cost_val, self._status])
         df = df.rename(index={0:'initial rate', 1:'decline rate', 2:'b exponent',
                               3:'cost value', 4:'status'})
-        df = df.rename(columns=self._MODEL_NAME)
+        df = df.rename(columns={0:self._MODEL_NAME[self._model]})
         return df
         
