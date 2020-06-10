@@ -7,13 +7,14 @@ from scipy.stats import probplot
 from functools import partial
 
 import matplotlib.pyplot as plt
-import matplotlib.colors as clr
 from matplotlib.ticker import FuncFormatter
 
 from tqdm import tqdm
 import logging
 
-class ArpsDecline():
+from petrocast.models import arpsmodel
+
+class ArpsRegression():
     """ Arps Decline Curve Analysis
     ===
 
@@ -46,61 +47,23 @@ class ArpsDecline():
         if len(cumprod) != len(rate):
             raise IndexError("cumulative production and rate must have the same length")
     
-    def _exp_rate(self, cumprod: list, rate_init: float, d_rate: float):
-        cumprod = np.asarray(cumprod)
-        return rate_init - d_rate * cumprod
-
-    def _exp_time(self, rate: list, rate_init: float, d_rate: float):
-        rate = np.asarray(rate)
-        return np.log(rate_init/rate) / d_rate
-
-    def _exp_cum(self, rate: list, rate_init: float, d_rate: float):
-        rate = np.asarray(rate)
-        return (rate_init - rate)/d_rate
-
-    def _har_rate(self, cumprod: list, rate_init: float, d_rate: float):
-        cumprod = np.asarray(cumprod)
-        return np.exp(np.log(rate_init) - d_rate * cumprod / rate_init)
-
-    def _har_time(self, rate: list, rate_init: float, d_rate: float):
-        rate = np.asarray(rate)
-        return (1./rate - 1./rate_init) * rate_init/d_rate
-
-    def _har_cum(self, rate: list, rate_init: float, d_rate: float):
-        rate = np.asarray(rate)
-        return np.log(rate_init/rate)*rate_init/d_rate
-
-    def _hyp_rate(self, cumprod: list, rate_init: float, d_rate: float, b_exp: float):
-        cumprod = np.asarray(cumprod)
-        const = rate_init/(d_rate * (1 - b_exp))
-        return np.exp(np.log(1 - cumprod/const)/(1 - b_exp) + np.log(rate_init))
-
-    def _hyp_time(self, rate: list, rate_init: float, d_rate: float, b_exp: float):
-        rate = np.asarray(rate)
-        return (np.exp(b_exp*(np.log(rate_init) - np.log(rate))) - 1)/(b_exp * d_rate)
-
-    def _hyp_cum(self, rate: list, rate_init: float, d_rate: float, b_exp: float):
-        rate = np.asarray(rate)
-        const = rate_init/(d_rate * (1 - b_exp))
-        return const * (1 - np.power(rate/rate_init, (1 - b_exp)))
-
     def _fit_exp(self, cumprod, rate, d_rate_init: float=1E-5):
         init = np.asarray([rate[0], d_rate_init])
         result = optimize.least_squares(lambda x: \
-            rate - self._exp_rate(cumprod, x[0], x[1]), init, verbose=self._verbose)
+            rate - arpsmodel.exp_rate_cumprod(cumprod, x[0], x[1]), init, verbose=self._verbose)
         return result
 
     def _fit_har(self, cumprod, rate, d_rate_init: float=1E-5):
         init = np.asarray([rate[0], d_rate_init])
         result = optimize.least_squares(lambda x: 
-            rate - self._har_rate(cumprod, x[0], x[1]), init, verbose=self._verbose)
+            rate - arpsmodel.har_rate_cumprod(cumprod, x[0], x[1]), init, verbose=self._verbose)
         return result
     
     def _fit_hyp(self, cumprod, rate, d_rate_init: float=1E-5, b_exp_init: float=0.5):
         init = np.asarray([rate[0], d_rate_init, b_exp_init])
         rate
         result = optimize.least_squares(lambda x: \
-            rate - self._hyp_rate(cumprod, x[0], x[1], x[2]), \
+            rate - arpsmodel.hyp_rate_cumprod(cumprod, x[0], x[1], x[2]), \
             init, verbose=self._verbose, bounds=([1E-3, 1E-9, 1E-10], [np.inf, np.inf, 1 - 1E-10]))
         return result
 
@@ -132,7 +95,9 @@ class ArpsDecline():
         np.random.seed(seed)
         idx = np.random.randint(0, row, (sample, row))
         prod_sample = prod_data[idx]
-        bootstrap_result = [self._fit_data(prod_sample[s, :, 0], prod_sample[s, :, 1], model)
+        bootstrap_result = [self._fit_data(
+                                prod_sample[s, :, 0], prod_sample[s, :, 1], model,
+                                d_rate_init, b_exp_init)
                             for s in tqdm(range(sample))]
         rate_init = np.asarray([bootstrap_result[i].x[0] for i in range(sample)])
         d_rate = np.asarray([bootstrap_result[i].x[1] for i in range(sample)])
@@ -148,27 +113,28 @@ class ArpsDecline():
         # Calculate uncertainty in time and cumulative production.
         rate_init, d_rate, b_exp = self._bootstrap(self._model, sample=sample, seed=seed)
         if self._model == 'exp':
-            cumprod_forecast = np.asarray([self._exp_cum(rate_forecast, rate_init[s], d_rate[s])
+            cumprod_forecast = np.asarray([arpsmodel.exp_cumprod_rate(rate_forecast, rate_init[s], d_rate[s])
                                             for s in range(sample)])
-            time_forecast = np.asarray([self._exp_time(rate_forecast, rate_init[s], d_rate[s])
+            time_forecast = np.asarray([arpsmodel.exp_time_rate(rate_forecast, rate_init[s], d_rate[s])
                                         for s in range(sample)])
         elif self._model == 'har':
-            cumprod_forecast = np.asarray([self._har_cum(rate_forecast, rate_init[s], d_rate[s])
+            cumprod_forecast = np.asarray([arpsmodel.har_cumprod_rate(rate_forecast, rate_init[s], d_rate[s])
                                             for s in range(sample)])
-            time_forecast = np.asarray([self._har_time(rate_forecast, rate_init[s], d_rate[s])
+            time_forecast = np.asarray([arpsmodel.har_time_rate(rate_forecast, rate_init[s], d_rate[s])
                                         for s in range(sample)])
         else:
-            cumprod_forecast = np.asarray([self._hyp_cum(rate_forecast, rate_init[s], d_rate[s], b_exp[s])
+            cumprod_forecast = np.asarray([arpsmodel.hyp_cumprod_rate(rate_forecast, rate_init[s], 
+                                                                        d_rate[s], b_exp[s])
                                             for s in range(sample)])
-            time_forecast = np.asarray([self._hyp_time(rate_forecast, rate_init[s], d_rate[s], b_exp[s])
+            time_forecast = np.asarray([arpsmodel.hyp_time_rate(rate_forecast, rate_init[s], 
+                                                                d_rate[s], b_exp[s])
                                         for s in range(sample)])
         return time_forecast, cumprod_forecast
 
     def fit(self, model: str='best', d_rate_init: float=1E-5, b_exp_init: float=0.5,
             verbose: int=0, sig: float=0.2):
-        """ 
-        Fit the production model with the curves.
-        This method does not provide time based fitting.
+        """ Fit the production data with the curves.
+        This method intentionally does not provide time axis based fitting.
 
         Parameters
         ---
@@ -205,17 +171,17 @@ class ArpsDecline():
         self._message = result.message
         self._status = result.status
 
-        self._func_time = {'exp':self._exp_time,
-                           'har':self._har_time,
-                           'hyp':partial(self._hyp_time, b_exp=self._b_exp)}
+        self._func_time = {'exp':arpsmodel.exp_time_rate,
+                           'har':arpsmodel.har_time_rate,
+                           'hyp':partial(arpsmodel.hyp_time_rate, b_exp=self._b_exp)}
 
-        self._func_cum = {'exp':self._exp_cum,
-                          'har':self._har_cum,
-                          'hyp':partial(self._hyp_cum, b_exp=self._b_exp)}
+        self._func_cum = {'exp':arpsmodel.exp_cumprod_rate,
+                          'har':arpsmodel.har_cumprod_rate,
+                          'hyp':partial(arpsmodel.hyp_cumprod_rate, b_exp=self._b_exp)}
         
-        self._func_rate = {'exp':self._exp_rate,
-                           'har':self._har_rate,
-                           'hyp':partial(self._hyp_rate, b_exp=self._b_exp)}
+        self._func_rate = {'exp':arpsmodel.exp_rate_cumprod,
+                           'har':arpsmodel.har_rate_cumprod,
+                           'hyp':partial(arpsmodel.hyp_rate_cumprod, b_exp=self._b_exp)}
 
         logging.debug(f'Best fitting \n', \
                         'method: {self._best}, cost value: {self._cost_val[self._best]}')
